@@ -1,8 +1,8 @@
 # CooldownHook
 
 A small Uniswap v4 hook: **each address may swap at most once per pool every N blocks.** N is fixed when the hook
-is deployed and must be between 1 and 1000. There is one callback (`beforeSwap`), one storage mapping, no owner,
-no admin, no upgrade path, and no dependency on the pool's fee tier.
+is deployed and must be between 1 and 1000. There are two callbacks (`afterInitialize` and `beforeSwap`), one
+storage mapping, no owner, no admin, and no upgrade path. Pools must use the dynamic-fee flag.
 
 This repository is source and tests for publication. It contains no token, no deployment script, no launch
 manifest and no website.
@@ -19,8 +19,8 @@ If an address last swapped in pool `P` at block `B`, its next swap in `P` is:
 So `N = 1` means "once per block", and `N = 10` means the 2nd swap can land ten blocks after the 1st. The window
 is measured from the most recent *accepted* swap — rejected attempts record nothing and do not extend it.
 
-What does **not** matter: swap direction (`zeroForOne` either way is a swap), swap size, exact-in vs exact-out,
-the pool's fee tier, and `hookData`. What **is** kept apart:
+What does **not** matter after a dynamic-fee pool is admitted: swap direction (`zeroForOne` either way is a
+swap), swap size, exact-in vs exact-out, the pool's current LP fee, and `hookData`. What **is** kept apart:
 
 - **Pools.** State is keyed `PoolId → address → block`. A swap in pool A never consumes pool B's allowance, even
   for the same address and the same hook instance, and even when A and B are the same token pair at different
@@ -56,19 +56,18 @@ that each user is a distinct `PoolManager.swap` caller — the hook itself will 
 
 ## Security posture
 
-- **Every callback authenticates the caller.** `beforeSwap` reverts `NotPoolManager` unless `msg.sender` is the
-  `PoolManager` fixed at construction. The other nine `IHooks` callbacks revert `HookNotImplemented` for every
-  caller, manager included; the address does not advertise them so the manager never calls them anyway.
-- **Permissions are exactly `beforeSwap`.** `getHookPermissions()` declares it and nothing else; the constructor
+- **Every declared callback authenticates the caller.** `afterInitialize` and `beforeSwap` revert `NotPoolManager`
+  unless `msg.sender` is the `PoolManager` fixed at construction. The other eight `IHooks` callbacks revert
+  `HookNotImplemented`; the address does not advertise them so the manager never calls them.
+- **Permissions are exactly `afterInitialize` and `beforeSwap`.** The constructor
   runs `Hooks.validateHookPermissions` and refuses to deploy to an address whose low 14 bits disagree. No
   `*ReturnDelta` flag is set: the hook gates the swap and never reshapes it. It returns `ZERO_DELTA` and a zero
-  fee override, so it works identically on static-fee and dynamic-fee pools and never touches an LP fee.
+  fee override, so it never changes the dynamic LP fee.
 - **No privileged surface.** No owner, no pause, no setter, no upgrade. `cooldownBlocks` and `poolManager` are
   immutables. Runtime code contains no `DELEGATECALL`, `CALLCODE` or `SELFDESTRUCT` (checked by the admission
   suite). The hook never holds funds and makes no external calls.
-- **No initialize callbacks.** The design needs nothing from the pool — not a dynamic fee, not a particular tick
-  spacing — so there is nothing to validate at `afterInitialize`, and a pool binding this hook opens without the
-  hook ever running (`test_initialize_doesNotInvolveTheHook`).
+- **Dynamic-fee pools only.** Authenticated `afterInitialize` rejects any key whose fee is not exactly
+  `LPFeeLibrary.DYNAMIC_FEE_FLAG`. This prevents a static-fee pool from being permanently created with the hook.
 - **Gas.** `beforeSwap` is one `SLOAD`, one comparison, one `SSTORE` and one event — well under the 50k target
   for a hot-path callback. Only the first swap per (pool, address) pays a cold slot.
 - **Not audited.** Tests passing is not an audit. Anything that routes other people's funds through this hook
@@ -82,15 +81,15 @@ The hook takes two constructor arguments and requires one property of its addres
 | ---------------- | -------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `_poolManager`   | `IPoolManager` | non-zero                                       | The canonical `PoolManager` on the target chain. Take it from Uniswap's published deployments, not from a README. Baked in forever. |
 | `_cooldownBlocks`| `uint256`      | `1 ≤ N ≤ 1000`                                 | Blocks, not seconds. Translate with the chain's block time: on a 12-second chain `N = 5` is about a minute, `N = 300` about an hour; on a 2-second chain divide accordingly. |
-| address          | —              | low 14 bits `== 0x0080` (`HookFlags.COOLDOWN_HOOK`, decimal `128`) | Mined with CREATE2. `test/utils/HookMiner.sol` is the search the tests use; the same loop works in a script. The address depends on the deployer, the salt and the full init code (bytecode **plus** encoded constructor args), so mine after fixing both arguments and deploy from the address you mined for. |
+| address          | —              | low 14 bits `== 0x1080` (`HookFlags.COOLDOWN_HOOK`, decimal `4224`) | Mined with CREATE2. `test/utils/HookMiner.sol` is the search the tests use; the same loop works in a script. The address depends on the deployer, the salt and the full init code (bytecode **plus** encoded constructor args), so mine after fixing both arguments and deploy from the address you mined for. |
 
 A mis-mined address fails at deployment (`HookAddressNotValid`), not at the first swap. `foundry.toml` sets
 `bytecode_hash = "none"` so the init code, and therefore the mined address, does not shift with source path or
 metadata differences between machines.
 
 There is no deployment script here on purpose. When one is written, it should do exactly: pick `N`, mine a salt
-for flags `0x80`, `CREATE2` the hook, verify `getHookPermissions()`/address agreement on-chain, and stop. Pools
-bind the hook via their `PoolKey.hooks`; the hook has no registry and no say in which pools use it.
+for flags `0x1080`, `CREATE2` the hook, verify `getHookPermissions()`/address agreement on-chain, and stop. Pools
+bind the hook via their `PoolKey.hooks` and must set `PoolKey.fee = LPFeeLibrary.DYNAMIC_FEE_FLAG`.
 
 ## Operational responsibilities
 
@@ -139,7 +138,7 @@ Coverage, by section:
   change identity.
 - **LP and donate** — add/remove during an active cooldown; full liquidity exit with tokens returned; donate
   unaffected.
-- **Pool shapes** — a `DYNAMIC_FEE_FLAG` pool works and its fee is not overridden; initialize never calls the hook.
+- **Pool shapes** — a `DYNAMIC_FEE_FLAG` pool works and its fee is not overridden; static-fee initialization reverts.
 - **Authentication** — every `IHooks` callback refuses non-manager callers; undeclared callbacks refuse the
   manager too; the manager itself is accepted and the cooldown then applies.
 
@@ -155,7 +154,7 @@ repository and are run against the attested creation code. They expect `src/Hook
 | Variable                  | Value for this hook                                                          |
 | ------------------------- | ---------------------------------------------------------------------------- |
 | `IMD_HOOK_CREATION_CODE`  | `type(CooldownHook).creationCode ++ abi.encode(poolManager, cooldownBlocks)` |
-| `IMD_HOOK_FLAGS`          | `128` (`0x80`, `beforeSwap` only)                                            |
+| `IMD_HOOK_FLAGS`          | `4224` (`0x1080`, `afterInitialize` and `beforeSwap`)                        |
 | `IMD_POOL_MANAGER`        | the `poolManager` address encoded above                                      |
 
 There is no token, so the token half of that suite skips. Both halves were exercised locally during development

@@ -75,8 +75,8 @@ contract CooldownHookTest is Test {
         approveAll(token1);
         approveAll(token2);
 
-        keyA = poolKey(token0, token1, 3_000);
-        keyB = poolKey(token0, token2, 3_000);
+        keyA = poolKey(token0, token1, LPFeeLibrary.DYNAMIC_FEE_FLAG);
+        keyB = poolKey(token0, token2, LPFeeLibrary.DYNAMIC_FEE_FLAG);
         manager.initialize(keyA, SQRT_PRICE_1_1);
         manager.initialize(keyB, SQRT_PRICE_1_1);
         addLiquidity(keyA, LIQUIDITY);
@@ -138,11 +138,11 @@ contract CooldownHookTest is Test {
         new CooldownHook(manager, COOLDOWN);
     }
 
-    function test_permissions_declareOnlyBeforeSwap() public view {
+    function test_permissions_declareAfterInitializeAndBeforeSwap() public view {
         Hooks.Permissions memory p = hook.getHookPermissions();
         assertTrue(p.beforeSwap);
         assertFalse(p.beforeInitialize);
-        assertFalse(p.afterInitialize);
+        assertTrue(p.afterInitialize);
         assertFalse(p.beforeAddLiquidity);
         assertFalse(p.afterAddLiquidity);
         assertFalse(p.beforeRemoveLiquidity);
@@ -156,9 +156,9 @@ contract CooldownHookTest is Test {
         assertFalse(p.afterRemoveLiquidityReturnDelta);
     }
 
-    function test_permissions_addressCarriesExactlyBeforeSwap() public view {
-        assertEq(HookFlags.flagsOf(address(hook)), HookFlags.BEFORE_SWAP);
-        assertEq(HookFlags.COOLDOWN_HOOK, uint160(0x80));
+    function test_permissions_addressCarriesExactlyDeclaredCallbacks() public view {
+        assertEq(HookFlags.flagsOf(address(hook)), HookFlags.AFTER_INITIALIZE | HookFlags.BEFORE_SWAP);
+        assertEq(HookFlags.COOLDOWN_HOOK, uint160(0x1080));
         assertTrue(HookFlags.matches(address(hook), HookFlags.COOLDOWN_HOOK));
     }
 
@@ -286,7 +286,7 @@ contract CooldownHookTest is Test {
         PoolKey memory key = PoolKey({
             currency0: Currency.wrap(address(token0)),
             currency1: Currency.wrap(address(token1)),
-            fee: 3_000,
+            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
             tickSpacing: TICK_SPACING,
             hooks: IHooks(address(fresh))
         });
@@ -346,7 +346,7 @@ contract CooldownHookTest is Test {
         PoolKey memory keyA2 = PoolKey({
             currency0: keyA.currency0,
             currency1: keyA.currency1,
-            fee: 500,
+            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
             tickSpacing: 10,
             hooks: IHooks(address(hook))
         });
@@ -448,8 +448,7 @@ contract CooldownHookTest is Test {
     // Pool shapes
     // ------------------------------------------------------------------------------------------------------------
 
-    /// @dev The hook needs no dynamic fee and never overrides the fee, but a dynamic-fee pool must work with it too:
-    /// returning a zero override from beforeSwap leaves the pool's own LP fee alone.
+    /// @dev Returning a zero override from beforeSwap leaves the dynamic pool's current LP fee alone.
     function test_dynamicFeePool_isAcceptedAndRateLimited() public {
         PoolKey memory dyn = poolKey(token1, token2, LPFeeLibrary.DYNAMIC_FEE_FLAG);
         manager.initialize(dyn, SQRT_PRICE_1_1);
@@ -463,12 +462,25 @@ contract CooldownHookTest is Test {
         assertEq(lpFee, 0, "the hook must not override a dynamic pool's fee");
     }
 
-    function test_initialize_doesNotInvolveTheHook() public {
-        // No initialize callbacks are declared, so a pool binding this hook opens without the hook ever running.
+    function test_initialize_rejectsStaticFeePool() public {
         PoolKey memory k = poolKey(token1, token2, 100);
         k.tickSpacing = 1;
-        vm.expectCall(address(hook), "", 0);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(hook),
+                IHooks.afterInitialize.selector,
+                abi.encodeWithSelector(CooldownHook.DynamicFeeRequired.selector, uint24(100)),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
         manager.initialize(k, SQRT_PRICE_1_1);
+    }
+
+    function test_afterInitialize_acceptsDynamicFeeFromPoolManager() public {
+        PoolKey memory k = poolKey(token1, token2, LPFeeLibrary.DYNAMIC_FEE_FLAG);
+        vm.prank(address(manager));
+        assertEq(hook.afterInitialize(address(this), k, SQRT_PRICE_1_1, 0), IHooks.afterInitialize.selector);
     }
 
     // ------------------------------------------------------------------------------------------------------------
@@ -512,9 +524,8 @@ contract CooldownHookTest is Test {
         ModifyLiquidityParams memory lp = ModifyLiquidityParams(-60, 60, 1 ether, bytes32(0));
         SwapParams memory sp = SwapParams(true, SWAP_AMOUNT, TickMath.MIN_SQRT_PRICE + 1);
         BalanceDelta zero = BalanceDelta.wrap(0);
-        bytes[9] memory calls = [
+        bytes[8] memory calls = [
             abi.encodeCall(IHooks.beforeInitialize, (address(this), keyA, SQRT_PRICE_1_1)),
-            abi.encodeCall(IHooks.afterInitialize, (address(this), keyA, SQRT_PRICE_1_1, 0)),
             abi.encodeCall(IHooks.beforeAddLiquidity, (address(this), keyA, lp, "")),
             abi.encodeCall(IHooks.afterAddLiquidity, (address(this), keyA, lp, zero, zero, "")),
             abi.encodeCall(IHooks.beforeRemoveLiquidity, (address(this), keyA, lp, "")),
@@ -556,7 +567,7 @@ contract CooldownHookTest is Test {
     // ------------------------------------------------------------------------------------------------------------
 
     /// @dev Deploys the hook the way a real deployment does: mine a salt so CREATE2 lands on an address that carries
-    /// exactly the beforeSwap bit, then deploy there.
+    /// exactly the declared callback bits, then deploy there.
     function deployHook(uint256 cooldown) internal returns (CooldownHook deployed) {
         bytes memory args = abi.encode(manager, cooldown);
         (address predicted, bytes32 salt) =

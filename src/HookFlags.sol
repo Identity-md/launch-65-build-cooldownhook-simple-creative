@@ -29,9 +29,9 @@ library HookFlags {
     /// @notice Every permission bit at once. The address bits above this mask carry no meaning to v4.
     uint160 internal constant ALL = Hooks.ALL_HOOK_MASK;
 
-    /// @notice The flags `CooldownHook` needs: `beforeSwap` and nothing else.
-    /// @dev This is the value to mine a `CooldownHook` address for (decimal 128, hex 0x80).
-    uint160 internal constant COOLDOWN_HOOK = BEFORE_SWAP;
+    /// @notice The flags `CooldownHook` needs: `afterInitialize` and `beforeSwap`.
+    /// @dev This is the value to mine a `CooldownHook` address for (decimal 4224, hex 0x1080).
+    uint160 internal constant COOLDOWN_HOOK = AFTER_INITIALIZE | BEFORE_SWAP;
 
     /// @notice The permission bits an address carries.
     function flagsOf(address hook) internal pure returns (uint160) {

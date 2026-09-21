@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
@@ -15,8 +16,8 @@ import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation
 ///
 /// The rule, precisely: if an address last swapped in pool P at block B, its next swap in P is accepted at block
 /// `B + cooldownBlocks` or later and rejected at any block in `[B, B + cooldownBlocks)`. Direction, size, and the
-/// pool's fee tier do not matter — a swap is a swap. Pools are independent: a swap in one pool never consumes the
-/// allowance in another, even for the same address and the same hook instance. Liquidity and donations are not
+/// pool's current dynamic LP fee do not matter — a swap is a swap. Pools are independent: a swap in one pool never
+/// consumes the allowance in another, even for the same address and the same hook instance. Liquidity and donations are not
 /// touched at all, so LPs can always enter and, more importantly, always exit.
 ///
 /// @dev Whose cooldown is it? The `sender` that `PoolManager` passes to `beforeSwap` is the address that called
@@ -31,9 +32,8 @@ import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation
 /// no pause, no parameter setter, no upgrade path: the cooldown is an immutable and the behaviour reviewed is the
 /// behaviour deployed.
 ///
-/// The hook does not require a dynamic-fee pool and never overrides the LP fee; it works with static-fee and
-/// dynamic-fee pools alike. It therefore declares no initialize callbacks — there is nothing about the pool it
-/// needs to validate.
+/// Pools using this hook must carry `LPFeeLibrary.DYNAMIC_FEE_FLAG`. `afterInitialize` authenticates the manager
+/// and enforces that invariant; `beforeSwap` never overrides the fee, so the manager's current dynamic fee applies.
 contract CooldownHook is IHooks {
     /// @notice Smallest accepted cooldown. One block means "once per block".
     uint256 public constant MIN_COOLDOWN_BLOCKS = 1;
@@ -62,6 +62,8 @@ contract CooldownHook is IHooks {
     error InvalidPoolManager();
     /// @notice The constructor was given a cooldown outside `[MIN_COOLDOWN_BLOCKS, MAX_COOLDOWN_BLOCKS]`.
     error InvalidCooldown(uint256 cooldownBlocks);
+    /// @notice A pool attempted to bind this hook without the required dynamic-fee flag.
+    error DynamicFeeRequired(uint24 fee);
     /// @notice `swapper` tried to swap in `poolId` before its window closed.
     error SwapCooldownActive(PoolId poolId, address swapper, uint256 lastSwapBlock, uint256 nextAllowedBlock);
 
@@ -72,8 +74,7 @@ contract CooldownHook is IHooks {
 
     /// @param _poolManager The canonical `PoolManager` this hook serves. Baked in; cannot change.
     /// @param _cooldownBlocks The window N, in blocks, in `[1, 1000]`.
-    /// @dev Reverts unless the address this is deployed to carries exactly the `beforeSwap` flag, so a mis-mined
-    /// deployment fails at deployment rather than at the first swap.
+    /// @dev Reverts unless the address carries exactly the `afterInitialize` and `beforeSwap` flags.
     constructor(IPoolManager _poolManager, uint256 _cooldownBlocks) {
         if (address(_poolManager) == address(0)) revert InvalidPoolManager();
         if (_cooldownBlocks < MIN_COOLDOWN_BLOCKS || _cooldownBlocks > MAX_COOLDOWN_BLOCKS) {
@@ -88,7 +89,7 @@ contract CooldownHook is IHooks {
     function getHookPermissions() public pure returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: false,
-            afterInitialize: false,
+            afterInitialize: true,
             beforeAddLiquidity: false,
             afterAddLiquidity: false,
             beforeRemoveLiquidity: false,
@@ -116,7 +117,7 @@ contract CooldownHook is IHooks {
     }
 
     // ---------------------------------------------------------------------------------------------------------
-    // The one callback this hook declares.
+    // The callbacks this hook declares.
     // ---------------------------------------------------------------------------------------------------------
 
     /// @inheritdoc IHooks
@@ -142,6 +143,18 @@ contract CooldownHook is IHooks {
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
+    /// @inheritdoc IHooks
+    function afterInitialize(address, PoolKey calldata key, uint160, int24)
+        external
+        view
+        override
+        onlyPoolManager
+        returns (bytes4)
+    {
+        if (!LPFeeLibrary.isDynamicFee(key.fee)) revert DynamicFeeRequired(key.fee);
+        return IHooks.afterInitialize.selector;
+    }
+
     // ---------------------------------------------------------------------------------------------------------
     // Everything else on IHooks. The address does not advertise these, so PoolManager never calls them; they
     // exist to satisfy the interface and they refuse every caller, manager included.
@@ -149,11 +162,6 @@ contract CooldownHook is IHooks {
 
     /// @inheritdoc IHooks
     function beforeInitialize(address, PoolKey calldata, uint160) external pure override returns (bytes4) {
-        revert HookNotImplemented();
-    }
-
-    /// @inheritdoc IHooks
-    function afterInitialize(address, PoolKey calldata, uint160, int24) external pure override returns (bytes4) {
         revert HookNotImplemented();
     }
 
